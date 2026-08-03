@@ -1,11 +1,11 @@
 import os
 import requests
-import pymysql
 import pandas as pd
 import pvlib
 from datetime import datetime
 from dotenv import load_dotenv
 from pvlib.location import Location
+from sqlalchemy import create_engine
 
 load_dotenv()
 
@@ -17,7 +17,6 @@ def get_location_object():
     return Location(
         latitude=LATITUDE, 
         longitude=LONGITUDE, 
-        tz='Europe/London', 
         name='Garden Shed'
     )
 
@@ -49,7 +48,7 @@ def get_tmy_data():
     return tmy_data
 
 
-def fetch_historial_load_data():
+def fetch_historical_load_data():
     host = os.getenv("DB_HOST")
     user = os.getenv("DB_USER")
     password = os.getenv("DB_PASSWORD")
@@ -58,16 +57,12 @@ def fetch_historial_load_data():
     if not all([host, user, password, database]):
         raise ValueError("Database credentials missing, check .env file")
 
-    connection = pymysql.connect(
-        host=host,
-        user=user,
-        password=password,
-        database=database
-    )
+    connection_string = f"mysql+pymysql://{user}:{password}@{host}/{database}"
+    engine = create_engine(connection_string)
     
     query = "SELECT DateTimeUTC, consumption AS electric FROM electric;"
-    df_elec = pd.read_sql_query(query, connection)
-    connection.close()
+
+    df_elec = pd.read_sql_query(query, engine)
 
     return df_elec
 
@@ -76,7 +71,7 @@ def get_tey_load(cutoff_date='2024-12-31', year=1990):
     """
     Computes a 8760-hour Typical Electricity Year (TEY) baseline.
     """
-    df_elec = fetch_historial_load_data()
+    df_elec = fetch_historical_load_data()
     df_elec['DateTimeUTC'] = pd.to_datetime(df_elec['DateTimeUTC'])
     df_elec = df_elec.set_index('DateTimeUTC')
 
@@ -113,8 +108,10 @@ def get_tey_load(cutoff_date='2024-12-31', year=1990):
     missing_slots = baseline_series.isna().sum()
     if missing_slots > 0:
         print(f'Interpolating {missing_slots} missing half hour slots in electrical history')
-        baseline_series = baseline_series.interpolate(method='time')
+        baseline_series = baseline_series.interpolate(method='time', limit_direction='both')
 
+    if baseline_series.isna().any():
+        raise ValueError("Unfillable gaps remain in the load baseline — check DB coverage")
 
     baseline_hourly = baseline_series.resample('1h').sum()
     baseline_hourly.name = 'baseline_kwh'
@@ -127,9 +124,12 @@ def _fetch_paginated_rates(base_url, start_time, end_time):
     rates = []
     url = f"{base_url}?period_from={start_time}&period_to={end_time}&page_size=1500"
     while url:
-        resp = requests.get(url).json()
-        rates.extend(resp.get('results', []))
-        url = resp.get('next')
+        resp = requests.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+        rates.extend(data.get('results', []))
+        url = data.get('next')
 
     df = pd.DataFrame(rates)
     df['valid_from'] = pd.to_datetime(df['valid_from'])
